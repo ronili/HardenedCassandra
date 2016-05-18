@@ -23,7 +23,6 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.apache.commons.lang3.StringUtils;
-
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
@@ -37,6 +36,9 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import cs.technion.ByzantineConfig;
+import cs.technion.ByzantineTools;
+
 // TODO convert this to a Builder pattern instead of encouraging M.add directly,
 // which is less-efficient since we have to keep a mutable HashMap around
 public class Mutation implements IMutation
@@ -47,6 +49,12 @@ public class Mutation implements IMutation
     public static final String FORWARD_TO = "FWD_TO";
     public static final String FORWARD_FROM = "FWD_FRM";
 
+    public Boolean isByzReadReapir = false;
+    public String ts;
+    public String clientId;
+    public String columns;
+    public String symmetricSign = "";
+    
     // todo this is redundant
     // when we remove it, also restore SerializationsTest.testMutationRead to not regenerate new Mutations each test
     private final String keyspaceName;
@@ -284,6 +292,21 @@ public class Mutation implements IMutation
             assert size > 0;
             for (Map.Entry<UUID, ColumnFamily> entry : mutation.modifications.entrySet())
                 ColumnFamily.serializer.serialize(entry.getValue(), out, version);
+            
+            if (ByzantineConfig.isSignaturesLogic && 
+            	ByzantineTools.isRelevantKeySpace(mutation.keyspaceName)){
+            	if (ByzantineConfig.isFullMACSignatures) {
+            		out.writeUTF(mutation.symmetricSign);
+            	}
+            	out.writeBoolean(mutation.isByzReadReapir);
+            	if (mutation.isByzReadReapir) {
+            		out.writeUTF(mutation.ts);
+            		out.writeUTF(mutation.columns);
+                	if (ByzantineConfig.isMacSignatures) {
+                		out.writeUTF(mutation.clientId);
+                	}
+            	}
+            }
         }
 
         public Mutation deserialize(DataInput in, int version, ColumnSerializer.Flag flag) throws IOException
@@ -313,8 +336,24 @@ public class Mutation implements IMutation
                     keyspaceName = cf.metadata().ksName;
                 }
             }
-
-            return new Mutation(keyspaceName, key, modifications);
+           
+            Mutation m = new Mutation(keyspaceName, key, modifications);
+            if (ByzantineConfig.isSignaturesLogic && 
+            	ByzantineTools.isRelevantKeySpace(keyspaceName)){
+            	if (ByzantineConfig.isFullMACSignatures) {
+            		m.symmetricSign = in.readUTF();
+            	}
+            	m.isByzReadReapir = in.readBoolean();
+            	if (m.isByzReadReapir) {
+            		m.ts = in.readUTF();
+            		m.columns = in.readUTF();
+                	if (ByzantineConfig.isMacSignatures) {
+                		m.clientId = in.readUTF();
+                	}
+            	}
+            }
+            
+            return m;
         }
 
         private ColumnFamily deserializeOneCf(DataInput in, int version, ColumnSerializer.Flag flag) throws IOException
@@ -345,6 +384,21 @@ public class Mutation implements IMutation
             for (Map.Entry<UUID,ColumnFamily> entry : mutation.modifications.entrySet())
                 size += ColumnFamily.serializer.serializedSize(entry.getValue(), TypeSizes.NATIVE, version);
 
+            if (ByzantineConfig.isSignaturesLogic && 
+            	ByzantineTools.isRelevantKeySpace(mutation.getKeyspaceName())){
+            	if (ByzantineConfig.isFullMACSignatures) {
+            		size += sizes.sizeof(mutation.symmetricSign);
+            	}
+            	size += sizes.sizeof(mutation.isByzReadReapir);
+            	if (mutation.isByzReadReapir) {
+            		size += sizes.sizeof(mutation.ts);
+            		size += sizes.sizeof(mutation.columns);
+                	if (ByzantineConfig.isMacSignatures) {
+                		size += sizes.sizeof(mutation.clientId);
+                	}
+            	}
+            }
+            
             return size;
         }
     }

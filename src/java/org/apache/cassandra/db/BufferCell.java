@@ -33,8 +33,8 @@ public class BufferCell extends AbstractCell
     private static final long EMPTY_SIZE = ObjectSizes.measure(new BufferCell(CellNames.simpleDense(ByteBuffer.allocate(1))));
 
     protected final CellName name;
-    protected final ByteBuffer value;
-    protected final long timestamp;
+    protected ByteBuffer value;
+    protected long timestamp;
 
     BufferCell(CellName name)
     {
@@ -76,6 +76,16 @@ public class BufferCell extends AbstractCell
     @Override
     public ByteBuffer value() {
         return value;
+    }
+    
+    // ronili
+    public void setValue(ByteBuffer value) {
+    	this.value = value;
+    }
+    
+    // ronili
+    public void setTimestamp(long ts) {
+    	this.timestamp = ts;
     }
 
     @Override

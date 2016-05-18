@@ -25,11 +25,17 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessageOut;
 import org.apache.cassandra.net.MessagingService;
 
+import cs.technion.ByzantineConfig;
+
 /*
  * This empty response is sent by a replica to inform the coordinator that the write succeeded
  */
 public class WriteResponse
 {
+	// ronili
+	public String signature = "";
+	public String signer = "";
+	
     public static final WriteResponseSerializer serializer = new WriteResponseSerializer();
 
     public MessageOut<WriteResponse> createMessage()
@@ -41,16 +47,33 @@ public class WriteResponse
     {
         public void serialize(WriteResponse wm, DataOutputPlus out, int version) throws IOException
         {
+        	if (ByzantineConfig.isSignaturesLogic) { 
+        		out.writeUTF(wm.signature);
+        		out.writeUTF(wm.signer);
+        	}
         }
 
         public WriteResponse deserialize(DataInput in, int version) throws IOException
         {
-            return new WriteResponse();
+        	WriteResponse wp = new WriteResponse();
+        	if (ByzantineConfig.isSignaturesLogic) { 
+	            wp.signature = in.readUTF();
+	            wp.signer = in.readUTF();
+        	}
+        	return wp;
         }
 
         public long serializedSize(WriteResponse response, int version)
         {
-            return 0;
+        	if (ByzantineConfig.isSignaturesLogic) { 
+            	TypeSizes sizes = TypeSizes.NATIVE;
+            	long size = 0;
+        		size += sizes.sizeof(response.signature);
+        		size += sizes.sizeof(response.signer);
+        		return size;
+        	}
+        	
+        	return 0;
         }
     }
 }

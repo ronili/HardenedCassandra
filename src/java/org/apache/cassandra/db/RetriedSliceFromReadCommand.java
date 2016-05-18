@@ -21,8 +21,9 @@ import java.nio.ByteBuffer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.db.filter.SliceQueryFilter;
+
+import cs.technion.ByzantineConfig;
 
 public class RetriedSliceFromReadCommand extends SliceFromReadCommand
 {
@@ -38,7 +39,13 @@ public class RetriedSliceFromReadCommand extends SliceFromReadCommand
     @Override
     public ReadCommand copy()
     {
-        return new RetriedSliceFromReadCommand(ksName, key, cfName, timestamp, filter, originalCount).setIsDigestQuery(isDigestQuery());
+    	ReadCommand rc = new RetriedSliceFromReadCommand(ksName, key, cfName, timestamp, filter, originalCount).setIsDigestQuery(isDigestQuery());
+    	if (ByzantineConfig.isSignaturesLogic) {
+    		rc.ts = ts;
+    		rc.clientName = clientName;
+    		rc.columns = columns;
+    	}
+        return rc;
     }
 
     @Override

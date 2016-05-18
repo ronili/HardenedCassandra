@@ -25,6 +25,9 @@ import org.apache.cassandra.db.ReadResponse;
 import org.apache.cassandra.db.Row;
 import org.apache.cassandra.net.MessageIn;
 
+import cs.technion.ByzantineConfig;
+import cs.technion.ByzantineTools;
+
 public class RowDigestResolver extends AbstractRowResolver
 {
     public RowDigestResolver(String keyspaceName, ByteBuffer key, int maxResponseCount)
@@ -36,7 +39,7 @@ public class RowDigestResolver extends AbstractRowResolver
      * Special case of resolve() so that CL.ONE reads never throw DigestMismatchException in the foreground
      */
     public Row getData()
-    {
+    {  	
         for (MessageIn<ReadResponse> message : replies)
         {
             ReadResponse result = message.payload;
@@ -44,13 +47,57 @@ public class RowDigestResolver extends AbstractRowResolver
             {
                 if (result.digest() == null)
                     result.setDigest(ColumnFamily.digest(result.row().cf));
-
-                return result.row();
+                
+                if (!ByzantineConfig.isSignaturesLogic) {
+                	return result.row();
+                }
+                
+                Row row = result.row();
+                
+                // ronili: saving the signature to our collection
+                if (ByzantineTools.isRelevantKeySpace(this.keyspaceName)) {
+                	if (ByzantineConfig.isInfoLogger)
+                		logger.info("[ronili] Collecting all signatures for response");
+		            computeAndSetAllSignatures();
+                }
+                
+                return row;
             }
         }
         return null;
     }
 
+    private ColumnFamily byzantineResolver() throws DigestMismatchException {
+    	ColumnFamily data = null;
+    	String digestSign = null;
+    	String digestVals = null;
+    	
+    	for (MessageIn<ReadResponse> message : replies)
+        {
+            ReadResponse response = message.payload;
+            String newDigestSign = response.clientSign;
+            String newDigestVals = response.hash;
+            if (!response.isDigestQuery())
+            {
+            	data = response.row().cf;
+            }
+
+            if (digestSign == null) {
+            	digestSign = newDigestSign;
+            	digestVals = newDigestVals;
+            } else if ( !digestSign.equals(newDigestSign) || 
+            			!digestVals.equals(newDigestVals) ){
+            	if (ByzantineConfig.isErrorLogger) 
+            		logger.error("[ronili] Byzantine Digest Exception");
+            	throw new DigestMismatchException(key, ByteBuffer.wrap(digestVals.getBytes()), ByteBuffer.wrap(newDigestVals.getBytes()));
+            }
+            
+            appendToSignaturesList(digestSign, response.signature + ":" + message.from);
+        }
+    	
+    	return data;
+    }
+    
     /*
      * This method handles two different scenarios:
      *
@@ -73,7 +120,16 @@ public class RowDigestResolver extends AbstractRowResolver
         ColumnFamily data = null;
         ByteBuffer digest = null;
 
-        for (MessageIn<ReadResponse> message : replies)
+        if (ByzantineConfig.isSignaturesLogic) {
+		    if (ByzantineTools.isRelevantKeySpace(keyspaceName)) {
+		    	data = byzantineResolver();
+		        if (logger.isTraceEnabled())
+		            logger.trace("resolve: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+		    	return new Row(key, data);
+		    }
+        }
+        
+    	for (MessageIn<ReadResponse> message : replies)
         {
             ReadResponse response = message.payload;
 
@@ -94,8 +150,9 @@ public class RowDigestResolver extends AbstractRowResolver
 
             if (digest == null)
                 digest = newDigest;
-            else if (!digest.equals(newDigest))
-                throw new DigestMismatchException(key, digest, newDigest);
+            else if (!digest.equals(newDigest)) {
+            	throw new DigestMismatchException(key, digest, newDigest);
+            }
         }
 
         if (logger.isTraceEnabled())

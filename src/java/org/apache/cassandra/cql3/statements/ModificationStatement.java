@@ -23,6 +23,8 @@ import java.util.*;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 
+import cs.technion.ByzantineConfig;
+
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.ColumnDefinition;
@@ -490,6 +492,7 @@ public abstract class ModificationStatement implements CQLStatement
         if (hasConditions() && options.getProtocolVersion() == 1)
             throw new InvalidRequestException("Conditional updates are not supported by the protocol version in use. You need to upgrade to a driver using the native protocol v2.");
 
+        // ronili : Simple write is without.
         return hasConditions()
              ? executeWithCondition(queryState, options)
              : executeWithoutCondition(queryState, options);
@@ -505,9 +508,16 @@ public abstract class ModificationStatement implements CQLStatement
             cl.validateForWrite(cfm.ksName);
 
         Collection<? extends IMutation> mutations = getMutations(options, false, options.getTimestamp(queryState));
-        if (!mutations.isEmpty())
-            StorageProxy.mutateWithTriggers(mutations, cl, false);
-
+        
+        if (!mutations.isEmpty()) {
+        	// ronili - Added the return.
+        	if (ByzantineConfig.isSignaturesLogic) {
+        		return StorageProxy.mutateWithTriggers(mutations, cl, false);
+        	} else {
+        		StorageProxy.mutateWithTriggers(mutations, cl, false);
+        	}
+        }
+        
         return null;
     }
 

@@ -26,6 +26,8 @@ import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import cs.technion.ByzantineConfig;
+
 /*
  * The read response message is sent by the server when reading data
  * this encapsulates the keyspacename and the row that has been read.
@@ -39,6 +41,11 @@ public class ReadResponse
     private final Row row;
     private volatile ByteBuffer digest;
 
+	// ronili
+    public String clientSign = "";
+	public String signature = "";
+	public String hash = "";
+    
     public ReadResponse(ByteBuffer digest)
     {
         this(null, digest);
@@ -95,6 +102,11 @@ class ReadResponseSerializer implements IVersionedSerializer<ReadResponse>
         out.writeBoolean(response.isDigestQuery());
         if (!response.isDigestQuery())
             Row.serializer.serialize(response.row(), out, version);
+        if (ByzantineConfig.isSignaturesLogic) {
+        	out.writeUTF(response.signature);
+        	out.writeUTF(response.clientSign);
+        	out.writeUTF(response.hash);
+        }
     }
 
     public ReadResponse deserialize(DataInput in, int version) throws IOException
@@ -116,7 +128,15 @@ class ReadResponseSerializer implements IVersionedSerializer<ReadResponse>
             row = Row.serializer.deserialize(in, version, ColumnSerializer.Flag.FROM_REMOTE);
         }
 
-        return isDigest ? new ReadResponse(ByteBuffer.wrap(digest)) : new ReadResponse(row);
+        ReadResponse rr = isDigest ? new ReadResponse(ByteBuffer.wrap(digest)) : new ReadResponse(row);
+
+        if (ByzantineConfig.isSignaturesLogic) { 
+        	rr.signature 	= in.readUTF();
+        	rr.clientSign 	= in.readUTF();
+        	rr.hash 		= in.readUTF();
+        }
+        
+        return rr;
     }
 
     public long serializedSize(ReadResponse response, int version)
@@ -128,6 +148,13 @@ class ReadResponseSerializer implements IVersionedSerializer<ReadResponse>
         size += typeSizes.sizeof(response.isDigestQuery());
         if (!response.isDigestQuery())
             size += Row.serializer.serializedSize(response.row(), version);
+        
+        if (ByzantineConfig.isSignaturesLogic) { 
+        	size += typeSizes.sizeof(response.signature);
+        	size += typeSizes.sizeof(response.clientSign);
+        	size += typeSizes.sizeof(response.hash);
+        }
+        
         return size;
     }
 }

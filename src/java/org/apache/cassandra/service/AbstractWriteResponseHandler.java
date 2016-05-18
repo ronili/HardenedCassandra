@@ -18,14 +18,18 @@
 package org.apache.cassandra.service;
 
 import java.net.InetAddress;
+import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import com.google.common.collect.Iterables;
+
+import cs.technion.ByzantineConfig;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
@@ -40,6 +44,12 @@ public abstract class AbstractWriteResponseHandler<T> implements IAsyncCallbackW
 {
     protected static final Logger logger = LoggerFactory.getLogger( AbstractWriteResponseHandler.class );
 
+    protected byte[] clientSignature = null;
+    
+    public void setClientSignature(byte[] sig) {
+    	clientSignature = sig;
+    }
+    
     private final SimpleCondition condition = new SimpleCondition();
     protected final Keyspace keyspace;
     protected final long start;
@@ -51,7 +61,8 @@ public abstract class AbstractWriteResponseHandler<T> implements IAsyncCallbackW
     private static final AtomicIntegerFieldUpdater<AbstractWriteResponseHandler> failuresUpdater
         = AtomicIntegerFieldUpdater.newUpdater(AbstractWriteResponseHandler.class, "failures");
     private volatile int failures = 0;
-
+    protected volatile List<List<ByteBuffer>> signatures; 
+    
     /**
      * @param callback A callback to be called when the write is successful.
      */
@@ -69,6 +80,16 @@ public abstract class AbstractWriteResponseHandler<T> implements IAsyncCallbackW
         this.naturalEndpoints = naturalEndpoints;
         this.callback = callback;
         this.writeType = writeType;
+    }
+    
+    protected Integer waitFor = null;
+    
+    public void setWaitFor(Integer num){
+    	waitFor = num;
+    }
+    
+    public List<List<ByteBuffer>> getSignatures() {
+    	return this.signatures;
     }
 
     public void get() throws WriteTimeoutException, WriteFailureException
@@ -112,6 +133,11 @@ public abstract class AbstractWriteResponseHandler<T> implements IAsyncCallbackW
      */
     protected int totalBlockFor()
     {
+    	 if (ByzantineConfig.isSignaturesLogic && ByzantineConfig.isWriteOption2) {
+    		 if (waitFor != null) {
+    			 return waitFor + pendingEndpoints.size();
+    		 }
+    	 }
         // During bootstrap, we have to include the pending endpoints or we may fail the consistency level
         // guarantees (see #833)
         return consistencyLevel.blockFor(keyspace) + pendingEndpoints.size();
@@ -140,6 +166,10 @@ public abstract class AbstractWriteResponseHandler<T> implements IAsyncCallbackW
 
     /** null message means "response from local write" */
     public abstract void response(MessageIn<T> msg);
+    
+    public void responseWithSignature(byte[] sign, String from) {};
+    
+    public void responseWithSignature(byte[] sign, String from, String fromAddr) {};
 
     public void assureSufficientLiveNodes() throws UnavailableException
     {

@@ -23,15 +23,18 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
-import org.apache.commons.lang3.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import cs.technion.ByzantineConfig;
 
+import org.slf4j.Logger;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.ReadResponse;
+import org.apache.cassandra.db.Row;
 import org.apache.cassandra.exceptions.ReadFailureException;
 import org.apache.cassandra.exceptions.ReadTimeoutException;
 import org.apache.cassandra.exceptions.UnavailableException;
@@ -46,10 +49,18 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.SimpleCondition;
 
+import cs.technion.ByzantineTools;
+
 public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFailure<TMessage>
 {
     protected static final Logger logger = LoggerFactory.getLogger( ReadCallback.class );
 
+    public boolean isDataResolver = false;
+//    private boolean shouldChekDataSignature = false;
+//    public void setChekDataSignature() {
+//    	shouldChekDataSignature = true;
+//    }
+    
     public final IResponseResolver<TMessage, TResolved> resolver;
     private final SimpleCondition condition = new SimpleCondition();
     final long start;
@@ -111,6 +122,9 @@ public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFail
             Tracing.trace("Read timeout: {}", ex.toString());
             if (logger.isTraceEnabled())
                 logger.trace("Read timeout: {}", ex.toString());
+            
+            if (ByzantineConfig.isErrorLogger)
+            	logger.error("[ronili] Throwing timeout " + ex.toString());
             throw ex;
         }
 
@@ -125,17 +139,60 @@ public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFail
 
         return blockfor == 1 ? resolver.getData() : resolver.resolve();
     }
-
-    public void response(MessageIn<TMessage> message)
+    
+    @SuppressWarnings("unused")
+	public void response(MessageIn<TMessage> message)
     {
-        resolver.preprocess(message);
-        int n = waitingFor(message.from)
-              ? recievedUpdater.incrementAndGet(this)
-              : received;
+    	int n = 0;
+    	if (!ByzantineConfig.isSignaturesLogic) {
+        	resolver.preprocess(message);
+            n = (waitingFor(message.from))
+                    ? recievedUpdater.incrementAndGet(this)
+                    : received;
+    	} else {
+    		boolean isMessageVerifiedByzantine = true;
+	    	
+    		if (ByzantineTools.isRelevantKeySpace(command.getKeyspace())) {
+    			ReadCommand readCommand = (ReadCommand) command;
+    			
+    			if (!ByzantineConfig.isReadOption2 || !isDataResolver) {
+    				ByzantineTools.computeAndInjectCassandraHashIfNecessary(message, logger, readCommand.columns);
+    			}
+    			
+    			if (!ByzantineConfig.isReadOption2){
+		    		isMessageVerifiedByzantine =
+	    				ByzantineTools.isReadResponseMessageVerified(
+		    					message,
+		    					readCommand.key,
+		    					logger,
+		    					readCommand.ts);
+    			}
+	    	}
+	    	
+	        if (isMessageVerifiedByzantine) {
+	        	resolver.preprocess(message);
+	        }
+	        n = (waitingFor(message.from) && isMessageVerifiedByzantine)
+	                ? recievedUpdater.incrementAndGet(this)
+	                : received;
+	                
+	        // Extreme logging:
+            //logger.info(String.format(
+        	//	"Got response, verified: %b gotTotal: %d blockedFor: %d isDataPresent: %b" , 
+        	//	isMessageVerifiedByzantine, n, blockfor, resolver.isDataPresent()));
+    	}
+        
+              
         if (n >= blockfor && resolver.isDataPresent())
         {
             condition.signalAll();
 
+            if (ByzantineConfig.isDataPathLogic) {
+	            if (ByzantineTools.isRelevantKeySpace(command.getKeyspace())) {
+	            	return;
+	            }
+            }
+            
             // kick off a background digest comparison if this is a result that (may have) arrived after
             // the original resolve that get() kicks off as soon as the condition is signaled
             if (blockfor < endpoints.size() && n == endpoints.size())
@@ -168,11 +225,12 @@ public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFail
 
     public void response(TMessage result)
     {
-        MessageIn<TMessage> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
+    	MessageIn<TMessage> message = MessageIn.create(FBUtilities.getBroadcastAddress(),
                                                        result,
                                                        Collections.<String, byte[]>emptyMap(),
                                                        MessagingService.Verb.INTERNAL_RESPONSE,
                                                        MessagingService.current_version);
+        
         response(message);
     }
 
@@ -216,7 +274,16 @@ public class ReadCallback<TMessage, TResolved> implements IAsyncCallbackWithFail
                 ReadRepairMetrics.repairedBackground.mark();
                 
                 ReadCommand readCommand = (ReadCommand) command;
-                final RowDataResolver repairResolver = new RowDataResolver(readCommand.ksName, readCommand.key, readCommand.filter(), readCommand.timestamp, endpoints.size());
+                final RowDataResolver repairResolver = 
+                		new RowDataResolver(
+                				readCommand.ksName, 
+                				readCommand.key, 
+                				readCommand.filter(), 
+                				readCommand.timestamp, 
+                				endpoints.size(), 
+                				readCommand.ts, 
+                				readCommand.clientName,
+                				readCommand.columns);
                 AsyncRepairCallback repairHandler = new AsyncRepairCallback(repairResolver, endpoints.size());
 
                 MessageOut<ReadCommand> message = ((ReadCommand) command).createMessage();

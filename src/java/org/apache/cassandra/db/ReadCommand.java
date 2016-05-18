@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 import java.io.DataInput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.List;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.filter.IDiskAtomFilter;
@@ -33,9 +34,19 @@ import org.apache.cassandra.service.IReadCommand;
 import org.apache.cassandra.service.RowDataResolver;
 import org.apache.cassandra.service.pager.Pageable;
 
+import cs.technion.ByzantineConfig;
+import cs.technion.ByzantineTools;
+
 public abstract class ReadCommand implements IReadCommand, Pageable
 {
-    public enum Type
+	public String ts;
+	public String columns;
+	public String clientName;
+	
+	// Should not be sent to node
+	public List<String> blackList;
+	
+	public enum Type
     {
         GET_BY_NAMES((byte)1),
         GET_SLICES((byte)2);
@@ -62,7 +73,7 @@ public abstract class ReadCommand implements IReadCommand, Pageable
 
     public final String ksName;
     public final String cfName;
-    public final ByteBuffer key;
+    public ByteBuffer key;
     public final long timestamp;
     private boolean isDigestQuery = false;
     protected final Type commandType;
@@ -145,32 +156,71 @@ class ReadCommandSerializer implements IVersionedSerializer<ReadCommand>
             default:
                 throw new AssertionError();
         }
+        
+        if (ByzantineConfig.isSignaturesLogic && 
+        	ByzantineTools.isRelevantKeySpace(command.ksName)) {
+        	out.writeUTF(command.ts);
+        	out.writeUTF(command.columns);
+        	if (ByzantineConfig.isMacSignatures) {
+        		out.writeUTF(command.clientName);
+        	}
+        }
     }
 
     public ReadCommand deserialize(DataInput in, int version) throws IOException
     {
         ReadCommand.Type msgType = ReadCommand.Type.fromSerializedValue(in.readByte());
+       
+        ReadCommand rc;
         switch (msgType)
         {
             case GET_BY_NAMES:
-                return SliceByNamesReadCommand.serializer.deserialize(in, version);
+                rc = SliceByNamesReadCommand.serializer.deserialize(in, version);
+                break;
             case GET_SLICES:
-                return SliceFromReadCommand.serializer.deserialize(in, version);
+                rc = SliceFromReadCommand.serializer.deserialize(in, version);
+                break;
             default:
                 throw new AssertionError();
         }
+        
+        if (ByzantineConfig.isSignaturesLogic && 
+        	ByzantineTools.isRelevantKeySpace(rc.ksName)) {
+        	rc.ts 	   =  in.readUTF();
+        	rc.columns =  in.readUTF();
+        	if (ByzantineConfig.isMacSignatures) {
+        		rc.clientName = in.readUTF();
+        	}
+        }
+        
+        return rc;
     }
 
     public long serializedSize(ReadCommand command, int version)
     {
+    	long size = 0;
         switch (command.commandType)
         {
             case GET_BY_NAMES:
-                return 1 + SliceByNamesReadCommand.serializer.serializedSize(command, version);
+                size = 1 + SliceByNamesReadCommand.serializer.serializedSize(command, version);
+                break;
             case GET_SLICES:
-                return 1 + SliceFromReadCommand.serializer.serializedSize(command, version);
+                size = 1 + SliceFromReadCommand.serializer.serializedSize(command, version);
+                break;
             default:
                 throw new AssertionError();
         }
+        
+        if (ByzantineConfig.isSignaturesLogic && 
+        	ByzantineTools.isRelevantKeySpace(command.ksName)) {
+        	TypeSizes typeSizes = TypeSizes.NATIVE;
+        	size += typeSizes.sizeof(command.ts);
+        	size += typeSizes.sizeof(command.columns);
+        	if (ByzantineConfig.isMacSignatures) {
+        		size += typeSizes.sizeof(command.clientName);
+        	}
+        }
+        
+        return size;
     }
 }

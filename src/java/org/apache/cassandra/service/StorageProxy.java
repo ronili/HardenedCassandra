@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
+
 import javax.management.MBeanServer;
 import javax.management.ObjectName;
 
@@ -31,19 +32,32 @@ import com.google.common.base.Predicate;
 import com.google.common.cache.CacheLoader;
 import com.google.common.collect.*;
 import com.google.common.util.concurrent.Uninterruptibles;
+
+import cs.technion.ByzantineCommands;
+import cs.technion.ByzantineConfig;
+import cs.technion.ByzantineTools;
+import cs.technion.ByzantineTools.NodeSignature;
+import cs.technion.ByzantineTools.StoreExtraData;
+
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.concurrent.StageManager;
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.ResultSet;
 import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.composites.CellName;
+import org.apache.cassandra.db.composites.CellNames;
 import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
 import org.apache.cassandra.db.index.SecondaryIndex;
 import org.apache.cassandra.db.index.SecondaryIndexSearcher;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
@@ -61,6 +75,7 @@ import org.apache.cassandra.metrics.*;
 import org.apache.cassandra.net.*;
 import org.apache.cassandra.service.paxos.*;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.triggers.TriggerExecutor;
 import org.apache.cassandra.utils.*;
 
@@ -94,10 +109,51 @@ public class StorageProxy implements StorageProxyMBean
 
     private static final double CONCURRENT_SUBREQUESTS_MARGIN = 0.10;
 
+    // Specifies the signatures result structure
+    private static ResultSet.ResultMetadata signaturesMetadata;
+    
     private StorageProxy() {}
 
     static
     {
+    	// ronili: ColumnSpecification should be done only once.
+    	//		   Used in order to return signatures to client.
+    	if (ByzantineConfig.isSignaturesLogic) {
+	        ColumnSpecification signColumn = 
+	        		new ColumnSpecification(
+	        				"dummyKS", 
+	        				"dummyCF", 
+	        				new ColumnIdentifier("sign", false), 
+	        				BytesType.instance);
+	        
+	        ColumnSpecification signerColumn = 
+	        		new ColumnSpecification(
+	        				"dummyKS", 
+	        				"dummyCF", 
+	        				new ColumnIdentifier("signer", false), 
+	        				UTF8Type.instance);
+	        
+	        List<ColumnSpecification> columns = null;
+    		if (ByzantineConfig.isWriteOption2) { 
+    			columns = new ArrayList<ColumnSpecification>(3);
+    	        ColumnSpecification signerAddrColumn = 
+    	        		new ColumnSpecification(
+    	        				"dummyKS", 
+    	        				"dummyCF", 
+    	        				new ColumnIdentifier("signerAddr", false), 
+    	        				UTF8Type.instance);
+    	        columns.add(signColumn);
+    	        columns.add(signerColumn);
+    	        columns.add(signerAddrColumn);
+    		} else {
+    			columns = new ArrayList<ColumnSpecification>(2);
+    	        columns.add(signColumn);
+    	        columns.add(signerColumn);
+    		}
+
+	    	signaturesMetadata = new ResultSet.ResultMetadata(columns);
+    	}
+    	     	
         MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
         try
         {
@@ -110,6 +166,7 @@ public class StorageProxy implements StorageProxyMBean
 
         standardWritePerformer = new WritePerformer()
         {
+        	//TODO: ronili
             public void apply(IMutation mutation,
                               Iterable<InetAddress> targets,
                               AbstractWriteResponseHandler<IMutation> responseHandler,
@@ -522,10 +579,13 @@ public class StorageProxy implements StorageProxyMBean
      *
      * @param mutations the mutations to be applied across the replicas
      * @param consistency_level the consistency level for the operation
+     * @return 
      */
-    public static void mutate(Collection<? extends IMutation> mutations, ConsistencyLevel consistency_level)
+    public static ResultMessage mutate(Collection<? extends IMutation> mutations, ConsistencyLevel consistency_level)
     throws UnavailableException, OverloadedException, WriteTimeoutException, WriteFailureException
     {
+    	ResultMessage resultMessage = null;
+    	
         Tracing.trace("Determining replicas for mutation");
         final String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
 
@@ -542,16 +602,30 @@ public class StorageProxy implements StorageProxyMBean
                 }
                 else
                 {
+                	if (ByzantineConfig.isInfoLogger)
+                		logger.info("[ronili] Proxy is handling write for key: " + new String(((Mutation)mutation).key().array()));
+                	
                     WriteType wt = mutations.size() <= 1 ? WriteType.SIMPLE : WriteType.UNLOGGED_BATCH;
                     responseHandlers.add(performWrite(mutation, consistency_level, localDataCenter, standardWritePerformer, null, wt));
                 }
             }
 
             // wait for writes.  throws TimeoutException if necessary
-            for (AbstractWriteResponseHandler<IMutation> responseHandler : responseHandlers)
-            {
-                responseHandler.get();
+            if (!ByzantineConfig.isSignaturesLogic) {
+                for (AbstractWriteResponseHandler<IMutation> responseHandler : responseHandlers) {
+                    responseHandler.get();
+                }
+            } else {
+                List<List<ByteBuffer>> allSignatures = new LinkedList<List<ByteBuffer>>();
+                for (AbstractWriteResponseHandler<IMutation> responseHandler : responseHandlers)
+                {
+                    responseHandler.get();
+                    allSignatures.addAll(responseHandler.getSignatures());
+                }
+            	ResultSet resultSet = new ResultSet(signaturesMetadata, allSignatures);
+            	resultMessage = new ResultMessage.Rows(resultSet);
             }
+
         }
         catch (WriteTimeoutException|WriteFailureException ex)
         {
@@ -593,6 +667,8 @@ public class StorageProxy implements StorageProxyMBean
         {
             writeMetrics.addNano(System.nanoTime() - startTime);
         }
+        
+        return resultMessage;
     }
 
     /** hint all the mutations (except counters, which can't be safely retried).  This means
@@ -624,7 +700,7 @@ public class StorageProxy implements StorageProxyMBean
     }
 
     @SuppressWarnings("unchecked")
-    public static void mutateWithTriggers(Collection<? extends IMutation> mutations,
+    public static ResultMessage mutateWithTriggers(Collection<? extends IMutation> mutations,
                                           ConsistencyLevel consistencyLevel,
                                           boolean mutateAtomically)
     throws WriteTimeoutException, WriteFailureException, UnavailableException, OverloadedException, InvalidRequestException
@@ -635,8 +711,12 @@ public class StorageProxy implements StorageProxyMBean
             mutateAtomically(augmented, consistencyLevel);
         else if (mutateAtomically)
             mutateAtomically((Collection<Mutation>) mutations, consistencyLevel);
-        else
-            mutate(mutations, consistencyLevel);
+        else {
+        	// ronili: Propagate signature
+        	return mutate(mutations, consistencyLevel);
+        }
+        
+        return null;
     }
 
     /**
@@ -801,8 +881,18 @@ public class StorageProxy implements StorageProxyMBean
         List<InetAddress> naturalEndpoints = StorageService.instance.getNaturalEndpoints(keyspaceName, tk);
         Collection<InetAddress> pendingEndpoints = StorageService.instance.getTokenMetadata().pendingEndpointsFor(tk, keyspaceName);
 
+        if (ByzantineConfig.isInfoLogger)
+        	logger.info("[ronili] Key token is: {}, targeting {} nodes ", tk.toString(), naturalEndpoints.size());
+        
         AbstractWriteResponseHandler<IMutation> responseHandler = rs.getWriteResponseHandler(naturalEndpoints, pendingEndpoints, consistency_level, callback, writeType);
-
+        if (ByzantineConfig.isSignaturesLogic) {
+        	if (ByzantineTools.isRelevantKeySpace(keyspaceName)){
+        		byte[] clientSign = 
+        				ByzantineTools.getClientSigns(mutation.getColumnFamilies().iterator().next()).getBytes();
+        		responseHandler.setClientSignature(clientSign);
+        	}
+        }
+        
         // exit early if we can't fulfill the CL at this time
         responseHandler.assureSufficientLiveNodes();
 
@@ -878,7 +968,8 @@ public class StorageProxy implements StorageProxyMBean
      * 
      * @throws OverloadedException if the hints cannot be written/enqueued
      */
-    public static void sendToHintedEndpoints(final Mutation mutation,
+    @SuppressWarnings("unused")
+	public static void sendToHintedEndpoints(final Mutation mutation,
                                              Iterable<InetAddress> targets,
                                              AbstractWriteResponseHandler<IMutation> responseHandler,
                                              String localDataCenter)
@@ -891,9 +982,49 @@ public class StorageProxy implements StorageProxyMBean
 
         boolean insertLocal = false;
 
+        List<String> blackListedNodes = null;
+        Map<String, String> symmetricMapping = null;
+        if (ByzantineConfig.isSignaturesLogic && 
+        	ByzantineConfig.isWriteOption2 &&
+        	ByzantineTools.isRelevantKeySpace(mutation.getKeyspaceName())) {
+        	
+        	//TODO get from mutation the list
+        	StoreExtraData extraData = ByzantineTools.getExtraData(mutation, logger);
+        	
+        	if (extraData == null || 
+        		extraData.list == null || 
+        		extraData.waitForNodes == null || 
+        		extraData.waitForNodes <= 0) {
+        		blackListedNodes = Collections.emptyList();
+        	} else {       		
+        		if (ByzantineConfig.isInfoLogger)
+        			logger.info("Using special targets");
+        		blackListedNodes = extraData.list;
+        		responseHandler.setWaitFor(extraData.waitForNodes);
+        		((WriteResponseHandler)responseHandler).setResponses(extraData.waitForNodes);;
+        	} 
+        	
+        	if (ByzantineConfig.isFullMACSignatures &&
+        		extraData != null) {
+        		mutation.symmetricSign = extraData.symmetricSignatures;
+        	}
+        	
+        } 
 
         for (InetAddress destination : targets)
         {
+        	if (ByzantineConfig.isSignaturesLogic 
+        		&& ByzantineConfig.isWriteOption2
+        		&& ByzantineTools.isRelevantKeySpace(mutation.getKeyspaceName())) {
+        		
+        		String dest = destination.toString();
+        		if (blackListedNodes.contains(dest)) {
+        			if (ByzantineConfig.isInfoLogger)
+            			logger.info("Skiping target " + dest);
+        			continue;
+        		}
+        	}
+        	
             // avoid OOMing due to excess hints.  we need to do this check even for "live" nodes, since we can
             // still generate hints for those if it's overloaded or simply dead but not yet known-to-be-dead.
             // The idea is that if we have over maxHintsInProgress hints in flight, this is probably due to
@@ -945,8 +1076,8 @@ public class StorageProxy implements StorageProxyMBean
         }
 
         if (insertLocal)
-            insertLocal(mutation, responseHandler);
-
+        	insertLocal(mutation, responseHandler);
+        
         if (dcGroups != null)
         {
             // for each datacenter, send the message to one node to relay the write to other replicas
@@ -1061,15 +1192,75 @@ public class StorageProxy implements StorageProxyMBean
 
     private static void insertLocal(final Mutation mutation, final AbstractWriteResponseHandler<IMutation> responseHandler)
     {
-
         StageManager.getStage(Stage.MUTATION).maybeExecuteImmediately(new LocalMutationRunnable()
         {
             public void runMayThrow()
             {
                 try
                 {
-                    mutation.apply();
-                    responseHandler.response(null);
+            		if (ByzantineConfig.isCommandPath) {
+            			if (ByzantineCommands.handleCommandPath(mutation.getKeyspaceName(), mutation, logger)) {
+            				if (ByzantineConfig.isInfoLogger)
+            					logger.info("[ronili] Command completed locally, returning.");  
+            				responseHandler.response(null);
+            				return;
+            			}
+            		}
+            		
+            		if (!ByzantineConfig.isSignaturesLogic) {
+            			mutation.apply();
+            			responseHandler.response(null);
+            			return;
+            		}
+                    
+            		String symmetricSign = null;
+            		if (ByzantineConfig.isFullMACSignatures) {
+            			if (!mutation.symmetricSign.isEmpty()) {
+            				symmetricSign = mutation.symmetricSign;
+            				if (ByzantineConfig.isInfoLogger) {
+            					logger.info("[ronili] Got symmetric sign {}", symmetricSign);
+            				} 
+            			} else {
+            				if (ByzantineConfig.isInfoLogger) {
+            					logger.info("[ronili] no symmetric sign.");
+            				}
+            			}
+            		}
+            		
+            		byte[] sign = ByzantineTools.checkMutationSignature(mutation, logger, symmetricSign);
+                    
+                    if (sign == null) {
+                    	if (ByzantineConfig.isErrorLogger)
+                    		logger.error("[ronili] Local write - Byzantine verification faild");
+                		return;
+                	} 
+                	
+                    if (ByzantineConfig.isInfoLogger)
+                    	logger.info("[ronili] Mutation verified, computed new signature. ");
+                    
+                    if (!ByzantineConfig.isCommandPath) {
+                    	mutation.apply();
+                		if (ByzantineConfig.isWriteOption2) { 
+                			responseHandler.responseWithSignature(sign, ByzantineTools.getNodeName(), FBUtilities.getBroadcastAddress().toString());
+                		} else {
+                			responseHandler.responseWithSignature(sign, ByzantineTools.getNodeName());
+                		}                    
+                	} else {
+                    	boolean shouldIgnoreThisWriteLoud = ByzantineCommands.shouldIgnoreThisWriteLoud(mutation, logger);
+                    	boolean shouldIgnoreThisWriteLoudSilence = ByzantineCommands.shouldIgnoreThisWriteSilence(mutation, logger);
+                    	
+                    	if (!shouldIgnoreThisWriteLoudSilence && !shouldIgnoreThisWriteLoud) {
+                    		mutation.apply();
+                    	}
+                    	
+                    	if (!shouldIgnoreThisWriteLoud) {
+                    		if (ByzantineConfig.isWriteOption2) { 
+                    			responseHandler.responseWithSignature(sign, ByzantineTools.getNodeName(), FBUtilities.getBroadcastAddress().toString());
+                    		} else {
+                    			responseHandler.responseWithSignature(sign, ByzantineTools.getNodeName());
+                    		}
+                    	}
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1340,6 +1531,32 @@ public class StorageProxy implements StorageProxyMBean
 
         return rows;
     }
+    
+    public static void throwMismatch(AbstractReadExecutor exec) throws DigestMismatchException {
+    	throw new DigestMismatchException(
+				StorageService.getPartitioner().decorateKey(exec.command.key), 
+				ByteBuffer.wrap("0".getBytes()), 
+				ByteBuffer.wrap("0".getBytes()));
+    }
+    
+	//Ronili
+	public static void throwMismatchIfOptimized(AbstractReadExecutor exec) throws DigestMismatchException {
+		if (ByzantineTools.isRelevantKeySpace(exec.resolver.keyspaceName)) {
+    		int allTargets = StorageProxy.getLiveSortedEndpoints(Keyspace.open(exec.command.ksName),exec.command.key).size();
+    		int contactedReplicas = exec.getContactedReplicas().size();
+    		if (allTargets > contactedReplicas) {
+    			throwMismatch(exec);
+    		}
+    	 }
+	}
+	
+	public static void filterBlacklistedEndpoints(List<InetAddress> endpoints, AbstractReadExecutor exec){
+		for(Iterator<InetAddress> it = endpoints.iterator(); it.hasNext(); ) {
+		    if(exec.command.blackList.contains(it.next().toString())) { 
+		        it.remove(); 
+		    }
+		 } 
+	}
 
     /**
      * This function executes local and remote reads, and blocks for the results:
@@ -1352,13 +1569,20 @@ public class StorageProxy implements StorageProxyMBean
      * 4. If the digests (if any) match the data return the data
      * 5. else carry out read repair by getting data from all the nodes.
      */
-    private static List<Row> fetchRows(List<ReadCommand> initialCommands, ConsistencyLevel consistencyLevel)
+    @SuppressWarnings("unused")
+	private static List<Row> fetchRows(List<ReadCommand> initialCommands, ConsistencyLevel consistencyLevel)
     throws UnavailableException, ReadFailureException, ReadTimeoutException
-    {
+    {	
         List<Row> rows = new ArrayList<>(initialCommands.size());
+        
         // (avoid allocating a new list in the common case of nothing-to-retry)
         List<ReadCommand> commandsToRetry = Collections.emptyList();
 
+        // Extract injected data
+    	if (ByzantineConfig.isSignaturesLogic) {
+    		ByzantineTools.extractInjectedDate(initialCommands, logger);
+    	}
+        
         do
         {
             List<ReadCommand> commands = commandsToRetry.isEmpty() ? initialCommands : commandsToRetry;
@@ -1372,9 +1596,16 @@ public class StorageProxy implements StorageProxyMBean
             {
                 ReadCommand command = commands.get(i);
                 assert !command.isDigestQuery();
-
+	                
                 AbstractReadExecutor exec = AbstractReadExecutor.getReadExecutor(command, consistencyLevel);
-                exec.executeAsync();
+                
+                // Ronili: Check if we should pass the execution of the first optimized read
+                if (!ByzantineConfig.isSignaturesLogic ||
+                	!ByzantineConfig.isReadOption2 ||
+                	command.blackList == null) {
+                	exec.executeAsync();
+                } 
+                
                 readExecutors[i] = exec;
             }
 
@@ -1388,18 +1619,60 @@ public class StorageProxy implements StorageProxyMBean
             {
                 try
                 {
-                    Row row = exec.get();
-                    if (row != null)
-                    {
-                        row = exec.command.maybeTrim(row);
-                        rows.add(row);
-                    }
-
+                	// Basic run (no-patch)
+                	if (!ByzantineConfig.isSignaturesLogic) { 
+                		Row row = exec.get();
+                		if (row != null) {
+                            row = exec.command.maybeTrim(row);
+                            rows.add(row);
+                        }
+                	// User request to skip this part
+                	} else if (ByzantineConfig.isReadOption2 && exec.command.blackList != null) { 
+                		throwMismatch(exec);
+                	} else {
+                		Row row;
+	                    try {
+	                    	// In option 2, not validating in the proxy
+	                    	// Not required as client will not verify this
+	                    	// If the answer is 'bad', we will hit a mismatch and fix it
+//	                    	if (!ByzantineConfig.isReadOption2) {
+//	                    		exec.handler.setChekDataSignature();
+//	                    	}
+	                    	row = exec.get();
+	                    } catch (ReadTimeoutException|ReadFailureException ex) {
+	                    	if (ByzantineConfig.isDataPathLogic) {
+	                    		// ronili : if contacted less then all of the replicas, 
+	                    		//			move to try again (with full read).
+	                    		throwMismatchIfOptimized(exec);
+	                    	}
+	                    	throw ex;
+	                    }
+	                    
+	                    // Injecting signatures
+	                    if (row != null) {
+	                        row = exec.command.maybeTrim(row);
+	                        
+	                        if (ByzantineTools.isRelevantKeySpace(exec.resolver.keyspaceName)) {
+	                        	String signatures = ((AbstractRowResolver)exec.handler.resolver).getSignatures();
+	                        	// ronili: handling the case where value not found in all nodes.
+	                        	if (row.cf == null) {
+	                            	row = ByzantineTools.buildSignaturesRow(exec.command.ksName, signatures, exec.command.key);
+	                            } else {
+	                            	ByzantineTools.injectGivenSignature(signatures, row, logger);
+	                            }
+	                        }
+	                        rows.add(row);
+	                    } 
+                	}
+                	
                     if (logger.isTraceEnabled())
                         logger.trace("Read: {} ms.", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - exec.handler.start));
                 }
                 catch (ReadTimeoutException|ReadFailureException ex)
                 {
+                	if (ByzantineConfig.isErrorLogger)
+                		logger.error("[ronili] 1st read ReadTimeoutException|ReadFailureException");
+                	
                     int blockFor = consistencyLevel.blockFor(Keyspace.open(exec.command.getKeyspace()));
                     int responseCount = exec.handler.getReceivedCount();
                     String gotData = responseCount > 0
@@ -1420,18 +1693,75 @@ public class StorageProxy implements StorageProxyMBean
                 }
                 catch (DigestMismatchException ex)
                 {
+                	if (ByzantineConfig.isErrorLogger)
+                		logger.error("[ronili] 1st read DigestMismatchException");
+                	
                     Tracing.trace("Digest mismatch: {}", ex);
 
                     ReadRepairMetrics.repairedBlocking.mark();
 
                     // Do a full data read to resolve the correct response (and repair node that need be)
-                    RowDataResolver resolver = new RowDataResolver(exec.command.ksName, exec.command.key, exec.command.filter(), exec.command.timestamp, exec.handler.endpoints.size());
-                    ReadCallback<ReadResponse, Row> repairHandler = new ReadCallback<>(resolver,
-                                                                                       ConsistencyLevel.ALL,
-                                                                                       exec.getContactedReplicas().size(),
-                                                                                       exec.command,
-                                                                                       Keyspace.open(exec.command.getKeyspace()),
-                                                                                       exec.handler.endpoints);
+                    ReadCallback<ReadResponse, Row> repairHandler;
+                    Collection<InetAddress> targetFullReadNodes;
+                    
+                    if (!(ByzantineConfig.isDataPathLogic || ByzantineConfig.isReadOption2)) {
+                    	RowDataResolver resolver = new RowDataResolver(
+                    			exec.command.ksName, 
+                    			exec.command.key, 
+                    			exec.command.filter(), 
+                    			exec.command.timestamp, 
+                    			exec.handler.endpoints.size(),
+                    			exec.command.ts,
+                    			exec.command.clientName,
+                    			exec.command.columns);
+                    	repairHandler = new ReadCallback<>(
+    							resolver, 
+    							ConsistencyLevel.ALL, 
+    							exec.getContactedReplicas().size(), 
+    							exec.command, 
+    							Keyspace.open(exec.command.ksName),	
+    							exec.handler.endpoints);
+                    	targetFullReadNodes = exec.getContactedReplicas();
+                    } else {
+                    	ConsistencyLevel cl = ConsistencyLevel.ALL;
+	                    int blockFor = exec.getContactedReplicas().size();
+	                    Keyspace keyspace = Keyspace.open(exec.command.ksName);
+	                    List<InetAddress> endpoints = exec.handler.endpoints;
+	                    targetFullReadNodes = exec.getContactedReplicas();
+	                    
+	                    if (ByzantineTools.isRelevantKeySpace(exec.command.ksName)) {
+	                    	// Contact all available, wait for 'consistencyLevel' (Quorum\Byzantine Quorum) 
+	                    	cl = consistencyLevel;
+	                    	blockFor = consistencyLevel.blockFor(Keyspace.open(exec.command.ksName)); 
+	                    	endpoints = StorageProxy.getLiveSortedEndpoints(keyspace,exec.command.key);
+	                    	
+	                    	// Remove endpoints that are in the blacklist
+	                    	if (ByzantineConfig.isReadOption2 && exec.command.blackList != null) {
+	                    		filterBlacklistedEndpoints(endpoints, exec);
+	                    	}
+	                    	targetFullReadNodes = endpoints;
+	                    }
+	                    
+                    	RowDataResolver resolver = new RowDataResolver(
+                    			exec.command.ksName, 
+                    			exec.command.key, 
+                    			exec.command.filter(), 
+                    			exec.command.timestamp, 
+                    			endpoints.size(),
+                    			endpoints,
+                    			cl,
+                    			exec.command.ts,
+                    			exec.command.clientName,
+                    			exec.command.columns);
+                    	repairHandler = new ReadCallback<>(
+    							resolver, 
+    							cl, 
+    							blockFor, 
+    							exec.command, 
+    							keyspace,	
+    							endpoints);
+                    	repairHandler.isDataResolver = true;
+                    }
 
                     if (repairCommands == null)
                     {
@@ -1442,7 +1772,7 @@ public class StorageProxy implements StorageProxyMBean
                     repairResponseHandlers.add(repairHandler);
 
                     MessageOut<ReadCommand> message = exec.command.createMessage();
-                    for (InetAddress endpoint : exec.getContactedReplicas())
+                    for (InetAddress endpoint : targetFullReadNodes)
                     {
                         Tracing.trace("Enqueuing full data read to {}", endpoint);
                         MessagingService.instance().sendRRWithFailure(message, endpoint, repairHandler);
@@ -1463,6 +1793,8 @@ public class StorageProxy implements StorageProxyMBean
                     Row row;
                     try
                     {
+                    	if (ByzantineConfig.isInfoLogger)
+                    		logger.info("[ronili] Waiting for full read from all");
                         row = handler.get();
                     }
                     catch (DigestMismatchException e)
@@ -1471,6 +1803,9 @@ public class StorageProxy implements StorageProxyMBean
                     }
                     catch (ReadTimeoutException e)
                     {
+                    	if (ByzantineConfig.isErrorLogger)
+                    		logger.error("[ronili] Full Read ReadTimeoutException");
+                    	
                         if (Tracing.isTracing())
                             Tracing.trace("Timed out waiting on digest mismatch repair requests");
                         else
@@ -1478,18 +1813,56 @@ public class StorageProxy implements StorageProxyMBean
                         // the caught exception here will have CL.ALL from the repair command,
                         // not whatever CL the initial command was at (CASSANDRA-7947)
                         int blockFor = consistencyLevel.blockFor(Keyspace.open(command.getKeyspace()));
-                        throw new ReadTimeoutException(consistencyLevel, blockFor-1, blockFor, true);
+                       	throw new ReadTimeoutException(consistencyLevel, blockFor-1, blockFor, true);
+                    }
+                    
+                    RowDataResolver resolver = (RowDataResolver)handler.resolver;
+                    
+                    // In read option 2b we send all of the results to the client
+                    if (ByzantineConfig.isSignaturesLogic &&
+                    	ByzantineConfig.isReadOption2b && 
+                    	ByzantineTools.isRelevantKeySpace(command.getKeyspace())){
+                    	
+                    	rows.addAll(resolver.getAllRowsInjected());
+                    	continue;
                     }
 
-                    RowDataResolver resolver = (RowDataResolver)handler.resolver;
+                    String signatures = "";
+                    if (ByzantineConfig.isSignaturesLogic) {
+	                    if (ByzantineTools.isRelevantKeySpace(command.ksName)) {
+	                    	String clientSign = resolver.clientSign;
+	                    	List<Pair<String,String>> signaturesList = ((AbstractRowResolver)handler.resolver).getSignaturesList();
+	                    	// Take only signatures that match the client sign and do not require writeback.
+	                    	signatures = ByzantineTools.assembleSignaturesStringPairs(clientSign, signaturesList);
+	                    	
+	                    }
+                    }
+                    
+                    List<String> wbSignatures = null;
                     try
                     {
                         // wait for the repair writes to be acknowledged, to minimize impact on any replica that's
                         // behind on writes in case the out-of-sync row is read multiple times in quick succession
-                        FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+                    	if (ByzantineConfig.isInfoLogger)
+                    		logger.info("Waiting for write back");
+                    	
+                    	if (ByzantineConfig.isSignaturesLogic || ByzantineConfig.isDataPathLogic) {
+	                        if (ByzantineTools.isRelevantKeySpace(command.ksName)) {
+	                        	if (resolver.writeBackHandler != null) {
+	                        		wbSignatures = resolver.writeBackHandler.get(DatabaseDescriptor.getWriteRpcTimeout());
+	                        	}
+	                        } else {
+	                        	FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+	                        }
+                    	} else {
+                    		FBUtilities.waitOnFutures(resolver.repairResults, DatabaseDescriptor.getWriteRpcTimeout());
+                    	}
                     }
                     catch (TimeoutException e)
                     {
+                    	if (ByzantineConfig.isErrorLogger)
+                    		logger.error("Timeout on write back.");
+                    	
                         if (Tracing.isTracing())
                             Tracing.trace("Timed out waiting on digest mismatch repair acknowledgements");
                         else
@@ -1497,7 +1870,15 @@ public class StorageProxy implements StorageProxyMBean
                         int blockFor = consistencyLevel.blockFor(Keyspace.open(command.getKeyspace()));
                         throw new ReadTimeoutException(consistencyLevel, blockFor-1, blockFor, true);
                     }
-
+                    
+                    if (ByzantineConfig.isSignaturesLogic) {
+	                    if (ByzantineTools.isRelevantKeySpace(command.ksName)) {
+	                    	signatures = ByzantineTools.assembleSignaturesString(signatures, wbSignatures);
+	                    	signatures = ByzantineTools.RESOLVED_PREFIX + signatures;
+		                    ByzantineTools.injectGivenSignature(signatures, row, logger);
+	                    }
+                    }
+                    
                     // retry any potential short reads
                     ReadCommand retryCommand = command.maybeGenerateRetryCommand(resolver, row);
                     if (retryCommand != null)
@@ -1513,11 +1894,17 @@ public class StorageProxy implements StorageProxyMBean
                     {
                         row = command.maybeTrim(row);
                         rows.add(row);
+                        
+                        // We send all versions as well so the client could verify us
+                        rows.addAll(resolver.getAllRowsInjected());
                     }
                 }
             }
         } while (!commandsToRetry.isEmpty());
-
+        
+        if (ByzantineConfig.isInfoLogger)
+        	logger.info("[ronili] - returning rows");
+        
         return rows;
     }
 
@@ -1538,9 +1925,27 @@ public class StorageProxy implements StorageProxyMBean
         {
             try
             {
+            	// ronili - local read path
                 Keyspace keyspace = Keyspace.open(command.ksName);
                 Row r = command.getRow(keyspace);
+                                
                 ReadResponse result = ReadVerbHandler.getResponse(command, r);
+                // inject signature as a member (not to table)
+                if (ByzantineTools.isRelevantKeySpace(command.ksName)) {
+                	String ts = command.ts;
+                	String clientId = command.clientName;
+                	String columns = command.columns;
+                	
+                	NodeSignature signature = ByzantineTools.computeNodeSignature(r,logger,ts, clientId, columns);
+                	if (signature != null) {
+	                	result.clientSign = signature.clientSign;
+	                	result.signature = signature.extenedNodeSign;
+	                	result.hash = signature.hvals;
+                	} else {
+                		// Compute signature on "empty"
+                		result.signature = ByzantineTools.computeEmptySignature(new String(command.key.array()),logger, ts, clientId);
+                	}
+                }
                 MessagingService.instance().addLatency(FBUtilities.getBroadcastAddress(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
                 handler.response(result);
             }

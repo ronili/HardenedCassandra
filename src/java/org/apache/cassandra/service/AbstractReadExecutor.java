@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Iterables;
+import cs.technion.ByzantineConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -93,7 +94,7 @@ public abstract class AbstractReadExecutor
 
     private void makeRequests(ReadCommand readCommand, Iterable<InetAddress> endpoints)
     {
-        MessageOut<ReadCommand> message = null;
+    	MessageOut<ReadCommand> message = null;
         boolean hasLocalEndpoint = false;
 
         for (InetAddress endpoint : endpoints)
@@ -152,11 +153,15 @@ public abstract class AbstractReadExecutor
      */
     public static AbstractReadExecutor getReadExecutor(ReadCommand command, ConsistencyLevel consistencyLevel) throws UnavailableException
     {
-        Keyspace keyspace = Keyspace.open(command.ksName);
+    	Keyspace keyspace = Keyspace.open(command.ksName);
         List<InetAddress> allReplicas = StorageProxy.getLiveSortedEndpoints(keyspace, command.key);
         ReadRepairDecision repairDecision = Schema.instance.getCFMetaData(command.ksName, command.cfName).newReadRepairDecision();
         List<InetAddress> targetReplicas = consistencyLevel.filterForQuery(keyspace, allReplicas, repairDecision);
 
+        if (ByzantineConfig.isInfoLogger) {
+        	logger.error("targeting {} replicas, from {} available.", targetReplicas.size(), allReplicas.size());
+        }
+        
         // Throw UAE early if we don't have enough replicas.
         consistencyLevel.assureSufficientLiveNodes(keyspace, targetReplicas);
 

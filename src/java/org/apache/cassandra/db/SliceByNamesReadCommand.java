@@ -22,6 +22,8 @@ import java.nio.ByteBuffer;
 
 import com.google.common.base.Objects;
 
+import cs.technion.ByzantineConfig;
+
 import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.filter.*;
@@ -44,7 +46,13 @@ public class SliceByNamesReadCommand extends ReadCommand
 
     public ReadCommand copy()
     {
-        return new SliceByNamesReadCommand(ksName, key, cfName, timestamp, filter).setIsDigestQuery(isDigestQuery());
+    	ReadCommand rc = new SliceByNamesReadCommand(ksName, key, cfName, timestamp, filter).setIsDigestQuery(isDigestQuery());
+    	if (ByzantineConfig.isSignaturesLogic) {
+    		rc.ts = ts;
+    		rc.clientName = clientName;
+    		rc.columns = columns;
+    	}
+        return rc;
     }
 
     public Row getRow(Keyspace keyspace)
